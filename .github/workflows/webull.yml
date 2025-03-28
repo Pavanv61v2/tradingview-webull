@@ -1,0 +1,229 @@
+name: TradingView-Webull Bridge
+'on':
+  repository_dispatch:
+    types:
+      - trading-signal
+  workflow_dispatch: null
+jobs:
+  place-order:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Process Trading Signal
+        env:
+          WEBULL_EMAIL: '${{ secrets.WEBULL_EMAIL }}'
+          WEBULL_PASSWORD: '${{ secrets.WEBULL_PASSWORD }}'
+          WEBULL_TRADE_PIN: '${{ secrets.WEBULL_TRADE_PIN }}'
+          WEBULL_DEVICE_ID: '${{ secrets.WEBULL_DEVICE_ID }}'
+          SIGNAL_DATA: '${{ toJson(github.event.client_payload) }}'
+          NOTIFICATIONS_ENABLED: 'true'
+          NOTIFICATION_EMAIL: '${{ secrets.NOTIFICATION_EMAIL }}'
+        run: |
+          echo "Received trading signal"
+          echo "Symbol: ${{ github.event.client_payload.symbol || 'N/A' }}"
+          echo "Action: ${{ github.event.client_payload.action || 'N/A' }}"
+          echo "Order size: ${{ github.event.client_payload.order_size || 'N/A' }}"
+          
+          # Install dependencies
+          pip install webull requests
+          
+          # Create and run the trading script
+          cat > trade.py << 'EOF'
+          import os
+          import json
+          import time
+          from datetime import datetime
+          from webull import webull
+          
+          # Trade log file
+          TRADE_LOG_FILE = 'trade_history.json'
+          
+          def log_trade(trade_info):
+              """Log trade information to file"""
+              try:
+                  # Check if the log file exists
+                  trades = []
+                  if os.path.exists(TRADE_LOG_FILE):
+                      # Read existing logs
+                      with open(TRADE_LOG_FILE, 'r') as f:
+                          try:
+                              trades = json.load(f)
+                          except json.JSONDecodeError:
+                              trades = []
+                  
+                  # Add the new trade
+                  trades.append(trade_info)
+                  
+                  # Write back to file
+                  with open(TRADE_LOG_FILE, 'w') as f:
+                      json.dump(trades, f, indent=2)
+                  
+                  print("Trade logged successfully!")
+              except Exception as e:
+                  print(f"Error logging trade: {str(e)}")
+          
+          def place_order():
+              """Main function to place order with Webull"""
+              try:
+                  # Get Webull credentials
+                  email = os.environ.get('WEBULL_EMAIL')
+                  password = os.environ.get('WEBULL_PASSWORD')
+                  trade_pin = os.environ.get('WEBULL_TRADE_PIN')
+                  device_id = os.environ.get('WEBULL_DEVICE_ID')
+                  
+                  if not email or not password or not trade_pin:
+                      raise ValueError("Webull credentials not provided")
+                  
+                  # Parse signal data
+                  signal_data = os.environ.get('SIGNAL_DATA')
+                  if not signal_data:
+                      raise ValueError("No signal data provided")
+                  
+                  signal = json.loads(signal_data)
+                  print(f"Processing signal: {signal}")
+                  
+                  # Extract trading information
+                  symbol = signal.get('symbol') or signal.get('ticker')
+                  if not symbol:
+                      raise ValueError("No symbol provided in signal")
+                  
+                  action = signal.get('action')
+                  if not action:
+                      raise ValueError("No action (buy/sell) provided in signal")
+                  
+                  is_buy = action.lower() == 'buy'
+                  action_type = 'BUY' if is_buy else 'SELL'
+                  
+                  # Parse order size
+                  order_size = 1  # Default to 1 share
+                  if signal.get('order_size') and signal['order_size'].isdigit():
+                      order_size = int(signal['order_size'])
+                  
+                  print(f"Preparing to place {action_type} order for {order_size} shares of {symbol}")
+                  
+                  # Initialize Webull
+                  wb = webull()
+                  
+                  # Login to Webull
+                  print("Logging in to Webull...")
+                  if device_id:
+                      wb.device_id = device_id  # Use saved device ID if available
+                  
+                  login_result = wb.login(email, password)
+                  print(f"Login result: {login_result}")
+                  
+                  # Get and save device ID for future sessions
+                  if not device_id:
+                      device_id = wb.device_id
+                      print(f"New device ID: {device_id} - save this to your GitHub secrets")
+                  
+                  # Get account ID
+                  account_id = wb.get_account_id()
+                  if not account_id:
+                      raise ValueError("Could not retrieve account ID")
+                  
+                  print(f"Using account ID: {account_id}")
+                  
+                  # Set trading PIN for placing orders
+                  wb.get_trade_token(trade_pin)
+                  print("Trading access confirmed")
+                  
+                  # Get stock ID for the symbol
+                  stock_id = wb.get_ticker(symbol)
+                  if not stock_id:
+                      raise ValueError(f"Could not find stock ID for symbol {symbol}")
+                  
+                  print(f"Stock ID for {symbol}: {stock_id}")
+                  
+                  # Place order
+                  if is_buy:
+                      # Place BUY order
+                      order_result = wb.place_order(
+                          stock=stock_id,
+                          action='BUY',
+                          priceType='MKT',  # Market order
+                          quantity=order_size
+                      )
+                  else:
+                      # Place SELL order
+                      order_result = wb.place_order(
+                          stock=stock_id,
+                          action='SELL',
+                          priceType='MKT',  # Market order
+                          quantity=order_size
+                      )
+                  
+                  print(f"Order result: {order_result}")
+                  
+                  # Check if order was successful
+                  if 'orderId' in order_result:
+                      print(f"Order placed successfully with ID: {order_result['orderId']}")
+                      order_status = 'success'
+                  else:
+                      print("Order placement failed")
+                      order_status = 'failed'
+                  
+                  # Log the trade
+                  trade_info = {
+                      'timestamp': datetime.now().isoformat(),
+                      'symbol': symbol,
+                      'action': 'buy' if is_buy else 'sell',
+                      'orderSize': order_size,
+                      'orderId': order_result.get('orderId', 'unknown'),
+                      'status': order_status
+                  }
+                  
+                  log_trade(trade_info)
+                  return trade_info
+              
+              except Exception as e:
+                  print(f"Error placing order: {str(e)}")
+                  
+                  # Log the failed trade
+                  try:
+                      trade_info = {
+                          'timestamp': datetime.now().isoformat(),
+                          'symbol': symbol if 'symbol' in locals() else 'UNKNOWN',
+                          'action': 'buy' if 'is_buy' in locals() and is_buy else 'sell' if 'is_buy' in locals() else 'UNKNOWN',
+                          'status': 'failed',
+                          'error': str(e)
+                      }
+                      log_trade(trade_info)
+                  except:
+                      print("Error logging trade failure")
+                  
+                  return {"error": str(e)}
+          
+          # Execute the function
+          if __name__ == "__main__":
+              result = place_order()
+              print("Order process completed.")
+          EOF
+          
+          python trade.py
+          
+          # Debug: List files after script execution
+          echo "Files in directory after script execution:"
+          ls -la
+      - name: Commit updated trade history
+        run: |
+          # Configure git
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          
+          # Check if trade_history.json exists
+          if [ -f "trade_history.json" ]; then
+            # Add the file and commit
+            git add trade_history.json
+            git commit -m "Update trade history [skip ci]" || echo "No changes to commit"
+            
+            # Push changes to the repository
+            git push || echo "Failed to push changes"
+          else
+            echo "trade_history.json not found"
+          fi
